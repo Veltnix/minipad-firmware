@@ -79,47 +79,62 @@ void KeyHandler::handle()
 
 void KeyHandler::updateSensorBoundaries(HEKey &key)
 {
-    // Calculate the value with the deadzone in the positive and negative direction applied.
-    uint16_t upperValue = key.rawValue - SENSOR_BOUNDARY_DEADZONE;
     uint16_t lowerValue = key.rawValue + SENSOR_BOUNDARY_DEADZONE;
 
-    // If the read value with deadzone applied is bigger than the current rest position, update it.
-    if (key.restPosition < upperValue)
-        key.restPosition = upperValue;
+    int32_t distanceFromRest =
+        (int32_t)key.restPosition - (int32_t)lowerValue;
 
-    // If the read value with deadzone applied is lower than the current down position, update it. Make sure that the distance to the rest position
-    // is at least SENSOR_BOUNDARY_MIN_DISTANCE (scaled with travel distance @ 4.00mm) to prevent poor calibration/analog range resulting in "crazy behaviour".
-    else if (key.downPosition > lowerValue &&
-             key.restPosition - lowerValue >= SENSOR_BOUNDARY_MIN_DISTANCE * TRAVEL_DISTANCE_IN_0_01MM / 400)
+    uint16_t minimumDistance =
+        SENSOR_BOUNDARY_MIN_DISTANCE *
+        TRAVEL_DISTANCE_IN_0_01MM / 400;
+
+    if (key.downPosition > lowerValue &&
+        distanceFromRest >= minimumDistance)
     {
-        // From here on, the down position has been set < rest position, therefore the key can be considered calibrated, allowing distance calculation.
-        key.calibrated = true;
-
         key.downPosition = lowerValue;
+        key.calibrated = true;
     }
 }
 
 void KeyHandler::scanHEKey(HEKey &key)
 {
-    // Read the value from the port of the specified key and run it through the SMA filter.
+    constexpr uint16_t REST_CALIBRATION_SAMPLES = 256;
+
     key.rawValue = key.filter(analogRead(HE_PIN(key.index)));
 
-    // Invert the value if the definition is set since in rare fields of application the sensor
-    // is mounted the other way around, resulting in a different polarity and inverted sensor readings.
-    // Since this firmware expects the value to go down when the button is pressed down, this is needed.
 #ifdef INVERT_SENSOR_READINGS
     key.rawValue = (1 << ANALOG_RESOLUTION) - 1 - key.rawValue;
 #endif
 
-    // If the SMA filter is fully initalized (at least one full circular buffering has been performed), calibration can be performed.
-    // This keeps track of the lowest and highest value reached on each key, giving us boundaries to map to an actual milimeter distance.
-    if (key.filter.initialized)
-        updateSensorBoundaries(key);
+    // Wait until the moving-average filter is initialized.
+    if (!key.filter.initialized)
+    {
+        key.distance = TRAVEL_DISTANCE_IN_0_01MM;
+        return;
+    }
 
-    // Make sure that the key is calibrated, which means that the down position (default 4095) was updated to be  smaller than the rest position.
-    // If that's not the case, we go with the total switch travel distance representing a key that is fully up, effectively disabling any value processing.
-    // This if-branch is inheritly triggered if the SMA filter is not initialized yet, as the default down position of 4095 was not updated yet.
-    if(!key.calibrated)
+    // Startup-only resting-position calibration.
+    if (!key.restCalibrated)
+    {
+        key.restCalibrationSum += key.rawValue;
+        key.restCalibrationSamples++;
+
+        if (key.restCalibrationSamples >= REST_CALIBRATION_SAMPLES)
+        {
+            key.restPosition =
+                key.restCalibrationSum / REST_CALIBRATION_SAMPLES;
+
+            key.restCalibrated = true;
+        }
+
+        key.distance = TRAVEL_DISTANCE_IN_0_01MM;
+        return;
+    }
+
+    // Only the pressed boundary may adapt during normal operation.
+    updateSensorBoundaries(key);
+
+    if (!key.calibrated)
     {
         key.distance = TRAVEL_DISTANCE_IN_0_01MM;
         return;
@@ -127,25 +142,43 @@ void KeyHandler::scanHEKey(HEKey &key)
 
 #ifdef USE_GAUSS_CORRECTION_LUT
 
-    // If gauss correction is enabled, use the GaussLUT instance to get the distance based on the adc value and the rest position
-    // of the key, which is used to determine the offset from the "ideal" rest position set by the lookup table calculations.
-    uint16_t distance = gaussLUT.adcToDistance(key.rawValue, key.restPosition);
+    uint16_t distance =
+        gaussLUT.adcToDistance(key.rawValue, key.restPosition);
 
-    // Stretch the value to the full travel distance using our down position since the LUT is rest-position based. Then invert and constrain it.
-    distance = distance * TRAVEL_DISTANCE_IN_0_01MM / gaussLUT.adcToDistance(key.downPosition, key.restPosition);
-    key.distance = constrain(TRAVEL_DISTANCE_IN_0_01MM - distance, 0, TRAVEL_DISTANCE_IN_0_01MM);
+    uint16_t fullDistance =
+        gaussLUT.adcToDistance(key.downPosition, key.restPosition);
+
+    if (fullDistance == 0)
+    {
+        key.distance = TRAVEL_DISTANCE_IN_0_01MM;
+        return;
+    }
+
+    distance = (uint32_t)distance *
+               TRAVEL_DISTANCE_IN_0_01MM / fullDistance;
+
+    key.distance = constrain(
+        TRAVEL_DISTANCE_IN_0_01MM - distance,
+        0,
+        TRAVEL_DISTANCE_IN_0_01MM
+    );
 
 #else
 
-    // Map the value with the down and rest position values to a range between 0 and TRAVEL_DISTANCE_IN_0_01MM and constrain it.
-    // This is done to guarantee that the unit for the numbers used across the firmware actually matches the milimeter metric.
-    // NOTE: This calcuation disregards the non-linear nature of the relation between a magnet's distance and it's magnetic field strength.
-    //       This firmware has a gauss correction, which can be enabled and adjusted to match the hardware specifications of the device.
-    return constrain(map(value, key.downPosition, key.restPosition, 0, TRAVEL_DISTANCE_IN_0_01MM), 0, TRAVEL_DISTANCE_IN_0_01MM);
+    key.distance = constrain(
+        map(
+            key.rawValue,
+            key.downPosition,
+            key.restPosition,
+            0,
+            TRAVEL_DISTANCE_IN_0_01MM
+        ),
+        0,
+        TRAVEL_DISTANCE_IN_0_01MM
+    );
 
 #endif
 }
-
 void KeyHandler::scanDigitalKey(DigitalKey &key)
 {
     // Read the digital key and consider it pressed if the pin status is LOW (because of PULLUP).
