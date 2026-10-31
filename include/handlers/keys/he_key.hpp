@@ -24,6 +24,11 @@ struct HEKey : Key
     // The current peak value for the rapid trigger logic.
     uint16_t rapidTriggerPeak = UINT16_MAX;
 
+    // EDITED SECTION
+    bool restCalibrated = false;
+    uint16_t restCalibrationSamples = 0;
+    uint32_t restCalibrationSum = 0;
+
     // The raw value with low-pass filter applied read from the Hall Effect sensor.
     uint16_t rawValue = 0;
 
